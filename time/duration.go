@@ -3,6 +3,7 @@ package time
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -20,7 +21,10 @@ func (d *Duration) UnmarshalJSON(b []byte) (err error) {
 	}
 
 	var id int64
-	id, err = json.Number(b).Int64()
+	id, err = strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return err
+	}
 	d.Duration = time.Duration(id)
 
 	return
