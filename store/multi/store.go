@@ -6,30 +6,10 @@ import (
 	"io"
 
 	store "github.com/kkrt-labs/go-utils/store"
-	filestore "github.com/kkrt-labs/go-utils/store/file"
-	s3store "github.com/kkrt-labs/go-utils/store/s3"
 )
 
 type Store struct {
 	stores []store.Store
-}
-
-func NewFromConfig(cfg Config) (store.Store, error) {
-	var stores []store.Store
-
-	if cfg.FileConfig != nil {
-		stores = append(stores, filestore.New(*cfg.FileConfig))
-	}
-
-	if cfg.S3Config != nil {
-		s3Store, err := s3store.New(cfg.S3Config)
-		if err != nil {
-			return nil, err
-		}
-		stores = append(stores, s3Store)
-	}
-
-	return &Store{stores: stores}, nil
 }
 
 func New(stores ...store.Store) store.Store {
@@ -45,7 +25,7 @@ func (m *Store) Store(ctx context.Context, key string, reader io.Reader, headers
 	return nil
 }
 
-func (m *Store) Load(ctx context.Context, key string, headers *store.Headers) (io.Reader, error) {
+func (m *Store) Load(ctx context.Context, key string, headers *store.Headers) (io.ReadCloser, error) {
 	// Try stores in order until we find the data or encounter an error
 	for _, s := range m.stores {
 		reader, err := s.Load(ctx, key, headers)

@@ -62,7 +62,7 @@ func (s *s3Store) Store(ctx context.Context, key string, reader io.Reader, heade
 	return nil
 }
 
-func (s *s3Store) Load(ctx context.Context, key string, headers *store.Headers) (io.Reader, error) {
+func (s *s3Store) Load(ctx context.Context, key string, headers *store.Headers) (io.ReadCloser, error) {
 	key = s.path(key, headers)
 	output, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &s.cfg.Bucket,
