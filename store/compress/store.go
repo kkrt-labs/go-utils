@@ -8,86 +8,81 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"path/filepath"
 
 	store "github.com/kkrt-labs/go-utils/store"
-	multistore "github.com/kkrt-labs/go-utils/store/multi"
 )
 
 type Store struct {
-	store    store.Store
-	encoding store.ContentEncoding
+	store           store.Store
+	contentEncoding store.ContentEncoding
 }
 
-func New(cfg Config) (*Store, error) {
-	multiStore, err := multistore.NewFromConfig(cfg.MultiStoreConfig)
-	if err != nil {
-		return nil, err
-	}
-
+func New(store store.Store, encoding store.ContentEncoding) store.Store {
 	return &Store{
-		store:    multiStore,
-		encoding: cfg.ContentEncoding,
-	}, nil
+		store:           store,
+		contentEncoding: encoding,
+	}
 }
 
 func (c *Store) Store(ctx context.Context, key string, reader io.Reader, headers *store.Headers) error {
-	if headers == nil {
-		headers = &store.Headers{}
-	}
-	headers.ContentEncoding = c.encoding
-
 	var compressedReader io.Reader
 
-	switch c.encoding {
+	switch c.contentEncoding {
 	case store.ContentEncodingGzip:
-		var buf bytes.Buffer
-		gw := gzip.NewWriter(&buf)
+		fmt.Println("compressing with gzip")
+		buf := bytes.NewBuffer(nil)
+		gw := gzip.NewWriter(buf)
+		defer gw.Close()
 		if _, err := io.Copy(gw, reader); err != nil {
-			gw.Close()
 			return fmt.Errorf("failed to compress with gzip: %w", err)
 		}
-		gw.Close()
-		compressedReader = &buf
+		compressedReader = buf
 
 	case store.ContentEncodingZlib:
+		fmt.Println("compressing with zlib")
 		var buf bytes.Buffer
 		zw := zlib.NewWriter(&buf)
+		defer zw.Close()
 		if _, err := io.Copy(zw, reader); err != nil {
-			zw.Close()
 			return fmt.Errorf("failed to compress with zlib: %w", err)
 		}
-		zw.Close()
 		compressedReader = &buf
 
 	case store.ContentEncodingFlate:
+		fmt.Println("compressing with flate")
 		var buf bytes.Buffer
 		fw, err := flate.NewWriter(&buf, flate.BestCompression)
 		if err != nil {
 			return fmt.Errorf("failed to create flate writer: %w", err)
 		}
+		defer fw.Close()
 		if _, err := io.Copy(fw, reader); err != nil {
-			fw.Close()
 			return fmt.Errorf("failed to compress with flate: %w", err)
 		}
-		fw.Close()
 		compressedReader = &buf
 
 	case store.ContentEncodingPlain:
+		fmt.Println("compressing with plain")
 		compressedReader = reader
+	default:
+		return fmt.Errorf("unsupported content encoding: %s", c.contentEncoding)
 	}
 
-	key = c.path(key, headers)
-	return c.store.Store(ctx, key, compressedReader, headers)
-}
-
-func (c *Store) Load(ctx context.Context, key string, headers *store.Headers) (io.Reader, error) {
 	if headers == nil {
 		headers = &store.Headers{}
 	}
-	headers.ContentEncoding = c.encoding
-	filename := c.path(key, headers)
-	reader, err := c.store.Load(ctx, filename, headers)
+	headers.ContentEncoding = c.contentEncoding
+
+	return c.store.Store(ctx, key, compressedReader, headers)
+}
+
+func (c *Store) Load(ctx context.Context, key string, headers *store.Headers) (io.ReadCloser, error) {
+	if headers == nil {
+		headers = &store.Headers{}
+	}
+	headers.ContentEncoding = c.contentEncoding
+
+	reader, err := c.store.Load(ctx, key, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -95,38 +90,21 @@ func (c *Store) Load(ctx context.Context, key string, headers *store.Headers) (i
 	if headers != nil {
 		switch headers.ContentEncoding {
 		case store.ContentEncodingGzip:
+			fmt.Println("decompressing with gzip")
 			return gzip.NewReader(reader)
 		case store.ContentEncodingZlib:
+			fmt.Println("decompressing with zlib")
 			return zlib.NewReader(reader)
 		case store.ContentEncodingFlate:
+			fmt.Println("decompressing with flate")
 			return flate.NewReader(reader), nil
 		case store.ContentEncodingPlain:
+			fmt.Println("decompressing with plain")
 			return reader, nil
+		default:
+			return nil, fmt.Errorf("unsupported content encoding: %s", headers.ContentEncoding)
 		}
 	}
 
 	return reader, nil
-}
-
-func (c *Store) path(key string, headers *store.Headers) string {
-	var filename string
-	contentType, err := headers.GetContentType()
-	if err != nil {
-		return ""
-	}
-
-	contentEncoding, err := headers.GetContentEncoding()
-	if err != nil {
-		return ""
-	}
-
-	keyPrefix := headers.KeyValue["key-prefix"]
-
-	if contentEncoding == store.ContentEncodingPlain {
-		filename = fmt.Sprintf("%s.%s", key, contentType)
-	} else {
-		filename = fmt.Sprintf("%s.%s.%s", key, contentType, contentEncoding.String())
-	}
-
-	return filepath.Join(keyPrefix, filename)
 }

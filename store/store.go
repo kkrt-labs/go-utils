@@ -22,7 +22,7 @@ type Store interface {
 	//
 	// The key is the identifier for the object.
 	// The headers are optional metadata about the object.
-	Load(ctx context.Context, key string, headers *Headers) (io.Reader, error)
+	Load(ctx context.Context, key string, headers *Headers) (io.ReadCloser, error)
 }
 
 // Headers are optional metadata about an object to store/load
@@ -59,13 +59,17 @@ var unknown = "unknown"
 type ContentType int
 
 const (
-	ContentTypeJSON ContentType = iota
+	ContentTypeUnknown ContentType = iota
+	ContentTypeText
+	ContentTypeJSON
 	ContentTypeProtobuf
 )
 
 var contentTypeStrings = [...]string{
-	"application/json",
-	"application/protobuf",
+	"",
+	"text/plain",
+	"text/json",
+	"text/protobuf",
 }
 
 func (ct ContentType) String() string {

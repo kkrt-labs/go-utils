@@ -12,21 +12,20 @@ import (
 )
 
 type Store struct {
-	cfg Config
+	dataDir string
 }
 
-func New(cfg Config) store.Store {
-	return &Store{cfg: cfg}
+func New(dataDir string) store.Store {
+	return &Store{dataDir: dataDir}
 }
 
 func (f *Store) Store(_ context.Context, key string, reader io.Reader, headers *store.Headers) error {
-	baseDir := f.baseDir(headers)
-	dir := filepath.Dir(filepath.Join(baseDir, key))
+	filePath := f.filePath(key, headers)
+	dir := filepath.Dir(filePath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	filePath := filepath.Join(baseDir, key)
 	file, err := os.Create(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
@@ -40,17 +39,49 @@ func (f *Store) Store(_ context.Context, key string, reader io.Reader, headers *
 	return nil
 }
 
-func (f *Store) Load(_ context.Context, key string, headers *store.Headers) (io.Reader, error) {
-	baseDir := f.baseDir(headers)
-	filePath := filepath.Join(baseDir, key)
-	return os.Open(filePath)
+func (f *Store) Load(_ context.Context, key string, headers *store.Headers) (io.ReadCloser, error) {
+	return os.Open(f.filePath(key, headers))
 }
 
-func (f *Store) baseDir(headers *store.Headers) string {
-	baseDir := f.cfg.DataDir
-	if headers != nil && strings.Contains(baseDir, "default") { // baseDir includes "default" as a substring
-		// replace default with chainID
-		baseDir = strings.Replace(baseDir, "default", headers.KeyValue["chainID"], 1)
+func (f *Store) filePath(key string, headers *store.Headers) string {
+	filePath := filepath.Join(f.dataDir, key)
+	var (
+		ct store.ContentType
+		ce store.ContentEncoding
+	)
+
+	if headers != nil {
+		ct = headers.ContentType
+		ce = headers.ContentEncoding
 	}
-	return baseDir
+	ext := Extension(ct, ce)
+	if ext != "" {
+		filePath = fmt.Sprintf("%s.%s", filePath, ext)
+	}
+
+	return filePath
+}
+
+func Extension(ct store.ContentType, ce store.ContentEncoding) string {
+	var parts []string
+
+	switch ct {
+	case store.ContentTypeText:
+		parts = append(parts, "txt")
+	case store.ContentTypeProtobuf:
+		parts = append(parts, "protobuf")
+	case store.ContentTypeJSON:
+		parts = append(parts, "json")
+	}
+
+	switch ce {
+	case store.ContentEncodingGzip:
+		parts = append(parts, "gz")
+	case store.ContentEncodingZlib:
+		parts = append(parts, "zlib")
+	case store.ContentEncodingFlate:
+		parts = append(parts, "flate")
+	}
+
+	return strings.Join(parts, ".")
 }
