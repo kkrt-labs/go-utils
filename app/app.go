@@ -25,6 +25,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -37,7 +38,6 @@ type App struct {
 
 	services map[string]*service
 
-	top     *service
 	current *service
 
 	done chan os.Signal
@@ -114,8 +114,6 @@ func (app *App) createService(id string, constructor func() (any, error), opts .
 	svc.construct()   // construct can perform calls to Provide moving the current service pointer
 	if previous != nil {
 		previous.addDep(svc)
-	} else {
-		app.top = svc
 	}
 
 	app.current = previous // restore the current service pointer
@@ -147,10 +145,14 @@ func provide[T any](app *App, id string, constructor func() (T, error), opts ...
 }
 
 func (app *App) Error() error {
-	if app.top == nil || app.top.err == nil {
-		return nil
+	var err error
+	for _, svc := range app.services {
+		if svc.isTop() {
+			err = multierr.Append(err, svc.err)
+		}
 	}
-	return app.top.err
+	fmt.Printf("Piou Error %v\n", err)
+	return err
 }
 
 func (app *App) getLogger(component string) *zap.Logger {
@@ -177,20 +179,28 @@ func (app *App) Start(ctx context.Context) error {
 }
 
 func (app *App) start(ctx context.Context) error {
-	if app.top == nil {
-		return fmt.Errorf("no service constructed yet")
-	}
-
-	if app.top.err != nil {
-		return app.top.err
-	}
-
 	app.setHandlers()
-	if err := app.top.start(ctx); err != nil {
-		return err
+
+	errs := make(chan error, len(app.services))
+	wg := sync.WaitGroup{}
+	for _, svc := range app.services {
+		if svc.isTop() {
+			wg.Add(1)
+			go func(svc *service) {
+				defer wg.Done()
+				errs <- svc.start(ctx)
+			}(svc)
+		}
+	}
+	wg.Wait()
+	close(errs)
+
+	var err error
+	for e := range errs {
+		err = multierr.Append(err, e)
 	}
 
-	return nil
+	return err
 }
 
 func (app *App) Stop(ctx context.Context) error {
@@ -206,15 +216,26 @@ func (app *App) Stop(ctx context.Context) error {
 }
 
 func (app *App) stop(ctx context.Context) error {
-	if app.top == nil {
-		return fmt.Errorf("no service constructed yet")
+	errs := make(chan error, len(app.services))
+	wg := sync.WaitGroup{}
+	for _, svc := range app.services {
+		if svc.isTop() {
+			wg.Add(1)
+			go func(svc *service) {
+				defer wg.Done()
+				errs <- svc.stop(ctx)
+			}(svc)
+		}
+	}
+	wg.Wait()
+	close(errs)
+
+	var err error
+	for e := range errs {
+		err = multierr.Append(err, e)
 	}
 
-	if err := app.top.stop(ctx); err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func (app *App) Run(ctx context.Context) error {
@@ -325,7 +346,6 @@ type service struct {
 
 	mux    sync.RWMutex
 	status atomic.Uint32
-	err    *ServiceError
 
 	startOnce sync.Once
 
@@ -336,6 +356,8 @@ type service struct {
 	tags          tag.Set
 	healthConfig  *health.Config
 	metricsPrefix string
+
+	err error
 }
 
 func newService(id string, constructor func() (any, error), opts ...ServiceOption) *service {
@@ -377,9 +399,13 @@ func (s *service) setStatusWithLock(status ServiceStatus) {
 	s.setStatus(status)
 }
 
-func (s *service) fail(err error) *ServiceError {
-	if svcErr, ok := err.(*ServiceError); ok {
-		s.err = svcErr
+func (s *service) isTop() bool {
+	return len(s.depsOf) == 0
+}
+
+func (s *service) fail(err error) error {
+	if s.err != nil {
+		s.err.(*ServiceError).directErr = err
 	} else {
 		s.err = &ServiceError{
 			svc:       s,
@@ -444,7 +470,7 @@ func (s *service) addDep(dep *service) {
 		if s.err == nil {
 			_ = s.fail(nil)
 		}
-		s.err.addDepsErr(dep.err)
+		s.err.(*ServiceError).addDepsErr(dep.err)
 	}
 }
 
@@ -468,7 +494,7 @@ func (s *service) getLogger() *zap.Logger {
 	return logger
 }
 
-func (s *service) start(ctx context.Context) *ServiceError {
+func (s *service) start(ctx context.Context) error {
 	s.startOnce.Do(func() {
 		if s.err != nil {
 			return
@@ -516,39 +542,33 @@ func (s *service) start(ctx context.Context) *ServiceError {
 	return s.err
 }
 
-func (s *service) stop(ctx context.Context) *ServiceError {
-	if s.err != nil {
-		return s.err
-	}
-
-	// if one of the dependencies is not running then don't stop
-	for _, dep := range s.depsOf {
-		if dep.Status() <= Stopping {
-			<-s.stopChan
-			return s.err
-		}
-	}
-
+func (s *service) stop(ctx context.Context) error {
 	s.stopOnce.Do(func() {
 		if s.err != nil {
 			return
 		}
 
+		// wait for all upper dependencies to have stopped
+		for _, dep := range s.depsOf {
+			<-dep.stopChan
+		}
+
 		s.setStatusWithLock(Stopping)
-		defer func() {
-			close(s.stopChan)
-		}()
 
 		if stop, ok := s.value.(svc.Runnable); ok {
 			s.getLogger().Info("Service stopping...")
 			err := stop.Stop(ctx)
+			close(s.stopChan)
 			if err != nil {
 				s.failWithLock(err)
 				s.getLogger().Error("Service failed to stop", zap.Error(err))
 				return
 			}
 			s.getLogger().Info("Service successfully stopped")
+		} else {
+			close(s.stopChan)
 		}
+
 		if s.err == nil {
 			s.setStatusWithLock(Stopped)
 		}
@@ -671,8 +691,8 @@ func (e *ServiceError) Error() string {
 	return s
 }
 
-func (e *ServiceError) addDepsErr(err *ServiceError) {
+func (e *ServiceError) addDepsErr(err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.depsErrs = append(e.depsErrs, err)
+	e.depsErrs = append(e.depsErrs, err.(*ServiceError))
 }

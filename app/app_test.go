@@ -150,15 +150,29 @@ func TestProvide(t *testing.T) {
 }
 
 type testService struct {
+	started bool
+	stopped bool
+
 	start chan error
 	stop  chan error
 }
 
 func (s *testService) Start(_ context.Context) error {
+	if s.started {
+		return errors.New("already started")
+	}
+	s.started = true
 	return <-s.start
 }
 
 func (s *testService) Stop(_ context.Context) error {
+	if !s.started {
+		return errors.New("not started")
+	}
+	if s.stopped {
+		return errors.New("already stopped")
+	}
+	s.stopped = true
 	return <-s.stop
 }
 
@@ -178,45 +192,45 @@ func TestAppNoDeps(t *testing.T) {
 		return app
 	}
 
-	recStart, recStop := make(chan error), make(chan error)
-	defer close(recStart)
-	defer close(recStop)
+	resStart, resStop := make(chan error), make(chan error)
+	defer close(resStart)
+	defer close(resStop)
 
 	t.Run("no errors", func(t *testing.T) {
 		app := testApp()
 		require.Equal(t, app.services["test"].Status(), Constructed)
 
 		go func() {
-			recStart <- app.Start(context.Background())
+			resStart <- app.Start(context.Background())
 		}()
 		time.Sleep(100 * time.Millisecond) // wait for the service to start
 		assert.Equal(t, app.services["test"].Status(), Starting)
 
 		// Trigger start
 		start <- nil
-		assert.Nil(t, <-recStart)
+		assert.Nil(t, <-resStart)
 		assert.Equal(t, app.services["test"].Status(), Running)
 
 		go func() {
-			recStop <- app.Stop(context.Background())
+			resStop <- app.Stop(context.Background())
 		}()
 		time.Sleep(100 * time.Millisecond) // wait for the service to start
 		assert.Equal(t, app.services["test"].Status(), Stopping)
 
 		// Trigger stop
 		stop <- nil
-		assert.Nil(t, <-recStop)
+		assert.Nil(t, <-resStop)
 		assert.Equal(t, app.services["test"].Status(), Stopped)
 	})
 
 	t.Run("error on start", func(t *testing.T) {
 		app := testApp()
 		go func() {
-			recStart <- app.Start(context.Background())
+			resStart <- app.Start(context.Background())
 		}()
 
 		start <- errors.New("error on start")
-		startErr := <-recStart
+		startErr := <-resStart
 		require.IsType(t, startErr, &ServiceError{})
 		assert.Equal(t, startErr.(*ServiceError).directErr, errors.New("error on start"))
 		assert.Equal(t, app.services["test"].Status(), Error)
@@ -225,16 +239,16 @@ func TestAppNoDeps(t *testing.T) {
 	t.Run("error on stop", func(t *testing.T) {
 		app := testApp()
 		go func() {
-			recStart <- app.Start(context.Background())
+			resStart <- app.Start(context.Background())
 		}()
 		start <- nil
-		<-recStart
+		<-resStart
 
 		go func() {
-			recStop <- app.Stop(context.Background())
+			resStop <- app.Stop(context.Background())
 		}()
 		stop <- errors.New("error on stop")
-		stopErr := <-recStop
+		stopErr := <-resStop
 		require.IsType(t, stopErr, &ServiceError{})
 		assert.Equal(t, stopErr.(*ServiceError).directErr, errors.New("error on stop"))
 		assert.Equal(t, app.services["test"].Status(), Error)
@@ -266,47 +280,143 @@ func TestAppWithDeps(t *testing.T) {
 	assert.Equal(t, app.services["main"].deps["dep"], app.services["dep"])
 	assert.Equal(t, app.services["dep"].depsOf["main"], app.services["main"])
 
-	recStart, recStop := make(chan error), make(chan error)
-	defer close(recStart)
-	defer close(recStop)
+	resStart, resStop := make(chan error), make(chan error)
+	defer close(resStart)
+	defer close(resStop)
 
 	go func() {
-		recStart <- app.Start(context.Background())
+		resStart <- app.Start(context.Background())
 	}()
 	startDep <- nil
 	startMain <- nil
-	assert.Nil(t, <-recStart)
+	assert.Nil(t, <-resStart)
 
 	go func() {
-		recStop <- app.Stop(context.Background())
+		resStop <- app.Stop(context.Background())
 	}()
 	stopMain <- nil
 	stopDep <- nil
-	assert.Nil(t, <-recStop)
+	assert.Nil(t, <-resStop)
+}
+
+func TestAppWithMultipleTopConstruct(t *testing.T) {
+	app := newTestApp(t)
+	startTop1, stopTop1, startTop2, stopTop2, startDep, stopDep := make(chan error), make(chan error), make(chan error), make(chan error), make(chan error), make(chan error)
+	defer close(startTop1)
+	defer close(stopTop1)
+	defer close(startTop2)
+	defer close(stopTop2)
+	defer close(startDep)
+	defer close(stopDep)
+
+	provideDep := func() *testService {
+		return Provide(app, "dep", func() (*testService, error) {
+			return &testService{
+				start: startDep,
+				stop:  stopDep,
+			}, nil
+		})
+	}
+
+	// Provide top1
+	dep := provideDep()
+
+	top1 := Provide(app, "top1", func() (*testService, error) {
+		provideDep()
+		return &testService{
+			start: startTop1,
+			stop:  stopTop1,
+		}, nil
+	})
+
+	// Provide top2
+	top2 := Provide(app, "top2", func() (*testService, error) {
+		provideDep()
+		return &testService{
+			start: startTop2,
+			stop:  stopTop2,
+		}, nil
+	})
+
+	// Test dependency tree
+	assert.Equal(t, app.services["top1"].deps["dep"], app.services["dep"])
+	assert.Equal(t, app.services["top2"].deps["dep"], app.services["dep"])
+	assert.Equal(t, app.services["dep"].depsOf["top1"], app.services["top1"])
+	assert.Equal(t, app.services["dep"].depsOf["top2"], app.services["top2"])
+
+	resStart := make(chan error)
+	defer close(resStart)
+	go func() {
+		resStart <- app.Start(context.Background())
+	}()
+
+	// Sleeps to ensure that deps as started at this point tops should be waiting for the dep to start
+	time.Sleep(100 * time.Millisecond)
+	assert.True(t, dep.started, "#1 dep should be started")
+	assert.False(t, top1.started, "#1 top1 should not be started")
+	assert.False(t, top2.started, "#1 top2 should not be started")
+
+	// Succeed dep start which should trigger top starts
+	startDep <- nil
+	time.Sleep(100 * time.Millisecond)
+	assert.True(t, top1.started, "#2 top1 should be started")
+	assert.True(t, top2.started, "#2 top2 should be started")
+
+	// Succeed tops start
+	startTop1 <- nil
+	startTop2 <- nil
+	assert.Nil(t, <-resStart)
+
+	//
+	resStop := make(chan error)
+	defer close(resStop)
+	go func() {
+		resStop <- app.Stop(context.Background())
+	}()
+
+	// Sleep ensure that service are stopping, at this point top1 and top2 should be stopped, but dep should not
+	time.Sleep(100 * time.Millisecond)
+	assert.True(t, top1.stopped, "#3 top1 should be stopped")
+	assert.True(t, top2.stopped, "#3 top2 should be stopped")
+	assert.False(t, dep.stopped, "#3 dep should not be stopped")
+
+	// Succeeds top 1 stop, then dep should still not be stopped
+	stopTop1 <- nil
+	time.Sleep(100 * time.Millisecond)
+	assert.False(t, dep.stopped, "#4 dep should not be stopped")
+
+	// Succeeds top 2 stop, then dep should now be stopped
+	stopTop2 <- nil
+	time.Sleep(100 * time.Millisecond)
+	assert.True(t, dep.stopped, "#5 dep should be stopped")
+
+	// Succeeds dep stop, then app.Stop should return
+	stopDep <- nil
+	assert.Nil(t, <-resStop)
 }
 
 func TestServiceError(t *testing.T) {
-	svc := newService("svc", nil)
-	dep1 := newService("dep1", nil)
-	dep2 := newService("dep2", nil)
-	dep11 := newService("dep11", nil)
-	dep21 := newService("dep21", nil)
+	app := newTestApp(t)
 
-	svcErr := svc.fail(errors.New("error on svc"))
-	dep1Err := dep1.fail(nil)
-	dep2Err := dep2.fail(errors.New("error on dep2"))
-	dep1Err.addDepsErr(dep11.fail(errors.New("error on dep11")))
-	dep2Err.addDepsErr(dep21.fail(nil))
-
-	svcErr.addDepsErr(dep1Err)
-	svcErr.addDepsErr(dep2Err)
+	Provide(app, "svc", func() (any, error) {
+		_ = Provide(app, "dep1", func() (any, error) {
+			_ = Provide(app, "dep11", func() (any, error) { return nil, fmt.Errorf("error on dep11") })
+			_ = Provide(app, "dep12", func() (any, error) { return nil, nil })
+			return nil, nil
+		})
+		_ = Provide(app, "dep2", func() (any, error) {
+			_ = Provide(app, "dep21", func() (any, error) { return nil, nil })
+			_ = Provide(app, "dep22", func() (any, error) { return nil, nil })
+			return nil, fmt.Errorf("error on dep2")
+		})
+		return nil, fmt.Errorf("error on svc")
+	})
 
 	expected := `service "svc": error on svc
 >service "dep1"
 >>service "dep11": error on dep11
->service "dep2": error on dep2
->>service "dep21"`
-	assert.Equal(t, svcErr.Error(), expected)
+>service "dep2": error on dep2`
+	assert.Equal(t, expected, app.Error().Error())
 }
 
 func TestAppServers(t *testing.T) {

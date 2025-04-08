@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/kkrt-labs/go-utils/app"
 	"github.com/kkrt-labs/go-utils/log"
@@ -16,6 +17,16 @@ type MyAppConfig struct {
 }
 
 type MyService struct {
+}
+
+func (s *MyService) Start(_ context.Context) error {
+	time.Sleep(2 * time.Second)
+	return nil
+}
+
+func (s *MyService) Stop(_ context.Context) error {
+	time.Sleep(2 * time.Second)
+	return nil
 }
 
 func main() {
@@ -50,9 +61,16 @@ func main() {
 		panic(fmt.Sprintf("Failed to create app: %v", err))
 	}
 
-	app.Provide(a, "my-service", func() (*MyService, error) {
-		a.EnableMainEntrypoint()
-		a.EnableHealthzEntrypoint()
+	app.Provide(a, "my-service-top1", func() (*MyService, error) {
+		app.Provide(a, "my-service-dep", func() (*MyService, error) {
+			return &MyService{}, nil
+		})
+		return &MyService{}, nil
+	})
+	app.Provide(a, "my-service-top2", func() (*MyService, error) {
+		app.Provide(a, "my-service-dep", func() (*MyService, error) {
+			return &MyService{}, nil
+		})
 		return &MyService{}, nil
 	})
 
